@@ -112,3 +112,35 @@ class TestLangChainAdapterToolExecution:
         assert result["details"] == "tool failed"
         assert result["tool"] == "failing_tool"
         assert result["tool_content"] == "tool failed"
+
+    def test_additional_properties_schema_keeps_extra_keys(self):
+        """A schema-valued additionalProperties must pass undeclared keys through."""
+        adapter = LangChainAdapter()
+        tool = Tool(
+            name="additional",
+            description="additional",
+            inputSchema={"type": "object", "additionalProperties": {"type": "integer"}},
+        )
+        langchain_tool = adapter._convert_tool(tool, MagicMock())
+
+        assert langchain_tool is not None
+        assert langchain_tool.args_schema.model_config.get("extra") == "allow"
+        assert langchain_tool._to_args_and_kwargs({"k": 1}, None) == ((), {"k": 1})
+
+    def test_additional_properties_true_keeps_extra_keys(self):
+        """additionalProperties: true must keep keys besides the declared properties."""
+        adapter = LangChainAdapter()
+        tool = Tool(
+            name="open",
+            description="open",
+            inputSchema={
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "additionalProperties": True,
+            },
+        )
+        langchain_tool = adapter._convert_tool(tool, MagicMock())
+
+        assert langchain_tool is not None
+        assert langchain_tool.args_schema.model_config.get("extra") == "allow"
+        assert langchain_tool._to_args_and_kwargs({"a": 1, "k": 2}, None) == ((), {"a": 1, "k": 2})

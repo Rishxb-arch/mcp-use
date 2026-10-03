@@ -24,7 +24,7 @@ from mcp.types import (
 from mcp.types import (
     Tool as MCPTool,
 )
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from mcp_use.agents.adapters.base import BaseAdapter
 from mcp_use.client.connectors.base import BaseConnector
@@ -33,6 +33,27 @@ from mcp_use.logging import logger
 
 LangChainContentBlock = dict[str, Any]
 LangChainToolResult = str | LangChainContentBlock | list[LangChainContentBlock]
+
+
+def _args_schema(schema: dict[str, Any]) -> type[BaseModel]:
+    """Build the tool args model, keeping extra keys when the schema allows them.
+
+    ``jsonschema_to_pydantic`` ignores keys that are not declared as properties.
+    When ``additionalProperties`` is true or a schema, those keys are part of the
+    input and must survive validation.
+
+    Args:
+        schema: Tool input JSON Schema, already normalized by ``fix_schema``.
+
+    Returns:
+        A Pydantic model for ``args_schema``. Extra keys are allowed only when
+        ``additionalProperties`` is true or a schema.
+    """
+    model = jsonschema_to_pydantic(schema)
+    additional = schema.get("additionalProperties") if isinstance(schema, dict) else None
+    if additional is True or isinstance(additional, dict):
+        return create_model(model.__name__, __base__=model, __config__=ConfigDict(extra="allow"))
+    return model
 
 
 def _mcp_content_to_langchain(content: list[Any]) -> str | list[LangChainContentBlock]:
@@ -146,7 +167,7 @@ class LangChainAdapter(BaseAdapter[BaseTool]):
             name: str = mcp_tool.name or "NO NAME"
             description: str = mcp_tool.description or ""
             # Convert JSON schema to Pydantic model for argument validation
-            args_schema: type[BaseModel] = jsonschema_to_pydantic(
+            args_schema: type[BaseModel] = _args_schema(
                 adapter_self.fix_schema(mcp_tool.inputSchema)  # Apply schema conversion
             )
             tool_connector: BaseConnector = connector  # Renamed variable to avoid name conflict
@@ -154,6 +175,25 @@ class LangChainAdapter(BaseAdapter[BaseTool]):
 
             def __repr__(self) -> str:
                 return f"MCP tool: {self.name}: {self.description}"
+
+            def _to_args_and_kwargs(self, tool_input: str | dict, tool_call_id: str | None = None):
+                """Pass undeclared keys through when the schema allows them.
+
+                LangChain skips validation and drops the input when ``args_schema``
+                has no declared fields. That is wrong for a schema whose only
+                constraint is ``additionalProperties``.
+                """
+                schema = self.args_schema
+                allows_extra = (
+                    isinstance(schema, type)
+                    and issubclass(schema, BaseModel)
+                    and schema.model_config.get("extra") == "allow"
+                    and not schema.model_fields
+                )
+                if allows_extra and isinstance(tool_input, dict):
+                    parsed = self._parse_input(tool_input, tool_call_id)
+                    return (), dict(parsed) if isinstance(parsed, dict) else {}
+                return BaseTool._to_args_and_kwargs(self, tool_input, tool_call_id)
 
             def _run(self, **kwargs: Any) -> NoReturn:
                 """Synchronous run method that always raises an error.
