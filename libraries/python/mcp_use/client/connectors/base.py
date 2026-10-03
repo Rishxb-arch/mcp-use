@@ -7,6 +7,7 @@ must implement.
 
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
 
@@ -44,6 +45,61 @@ from mcp_use.client.middleware import Middleware, MiddlewareManager
 from mcp_use.client.task_managers import ConnectionManager
 from mcp_use.logging import logger
 from mcp_use.telemetry.telemetry import telemetry
+
+
+class RepeatedCursorError(RuntimeError):
+    """Raised when a paginated MCP list repeats a cursor.
+
+    Attributes:
+        cursor: The cursor that was returned more than once.
+        items: Items collected from pages before the repeated cursor.
+    """
+
+    def __init__(self, cursor: str, items: list[Any]) -> None:
+        super().__init__(f"Repeated pagination cursor: {cursor!r}")
+        self.cursor = cursor
+        self.items = items
+
+
+async def _collect_paginated(list_page: Callable[..., Awaitable[Any]], item_attr: str) -> list[Any]:
+    """Follow ``nextCursor`` until the server has no further page.
+
+    An empty string is a real cursor, so the list is exhausted only when
+    ``next_cursor is None``. A cursor that appears twice is logged and raised
+    so the loop stops. Non-string cursors are treated as the end of the list.
+
+    Args:
+        list_page: ``client_session.list_tools``, ``list_resources``, or ``list_prompts``.
+        item_attr: Attribute holding this page's items (``tools``, ``resources``, or ``prompts``).
+
+    Returns:
+        Items from every page, in order.
+
+    Raises:
+        RepeatedCursorError: When ``nextCursor`` repeats a cursor already followed.
+    """
+    items: list[Any] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        result = await list_page() if cursor is None else await list_page(cursor=cursor)
+        if not result:
+            return items
+        page = getattr(result, item_attr, None) or []
+        items.extend(page)
+        next_cursor = getattr(result, "nextCursor", None)
+        # "" is a valid cursor; only None (or a non-string) ends the list.
+        if next_cursor is None or not isinstance(next_cursor, str):
+            return items
+        if next_cursor in seen:
+            logger.error(
+                "Repeated pagination cursor %r while listing %s; stopping",
+                next_cursor,
+                item_attr,
+            )
+            raise RepeatedCursorError(next_cursor, items)
+        seen.add(next_cursor)
+        cursor = next_cursor
 
 
 class BaseConnector(ABC):
@@ -265,10 +321,11 @@ class BaseConnector(ABC):
         self.capabilities = result.capabilities
 
         if self.capabilities.tools:
-            # Get available tools directly from client session
+            # Get available tools directly from client session, following nextCursor.
             try:
-                tools_result = await self.client_session.list_tools()
-                self._tools = tools_result.tools if tools_result else []
+                self._tools = await _collect_paginated(self.client_session.list_tools, "tools")
+            except RepeatedCursorError as e:
+                self._tools = e.items
             except Exception as e:
                 logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
                 self._tools = []
@@ -276,10 +333,11 @@ class BaseConnector(ABC):
             self._tools = []
 
         if self.capabilities.resources:
-            # Get available resources directly from client session
+            # Get available resources directly from client session, following nextCursor.
             try:
-                resources_result = await self.client_session.list_resources()
-                self._resources = resources_result.resources if resources_result else []
+                self._resources = await _collect_paginated(self.client_session.list_resources, "resources")
+            except RepeatedCursorError as e:
+                self._resources = e.items
             except Exception as e:
                 logger.error(f"Error listing resources for connector {self.public_identifier}: {e}")
                 self._resources = []
@@ -287,10 +345,11 @@ class BaseConnector(ABC):
             self._resources = []
 
         if self.capabilities.prompts:
-            # Get available prompts directly from client session
+            # Get available prompts directly from client session, following nextCursor.
             try:
-                prompts_result = await self.client_session.list_prompts()
-                self._prompts = prompts_result.prompts if prompts_result else []
+                self._prompts = await _collect_paginated(self.client_session.list_prompts, "prompts")
+            except RepeatedCursorError as e:
+                self._prompts = e.items
             except Exception as e:
                 logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
                 self._prompts = []
@@ -490,9 +549,11 @@ class BaseConnector(ABC):
 
         logger.debug("Listing tools")
         try:
-            result = await self.client_session.list_tools()
-            self._tools = result.tools
-            return result.tools
+            self._tools = await _collect_paginated(self.client_session.list_tools, "tools")
+            return self._tools
+        except RepeatedCursorError as e:
+            self._tools = e.items
+            raise
         except McpError as e:
             logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
             return []
@@ -510,9 +571,11 @@ class BaseConnector(ABC):
 
         logger.debug("Listing resources")
         try:
-            result = await self.client_session.list_resources()
-            self._resources = result.resources
-            return result.resources
+            self._resources = await _collect_paginated(self.client_session.list_resources, "resources")
+            return self._resources
+        except RepeatedCursorError as e:
+            self._resources = e.items
+            raise
         except McpError as e:
             logger.warning(f"Error listing resources for connector {self.public_identifier}: {e}")
             return []
@@ -538,9 +601,11 @@ class BaseConnector(ABC):
 
         logger.debug("Listing prompts")
         try:
-            result = await self.client_session.list_prompts()
-            self._prompts = result.prompts
-            return result.prompts
+            self._prompts = await _collect_paginated(self.client_session.list_prompts, "prompts")
+            return self._prompts
+        except RepeatedCursorError as e:
+            self._prompts = e.items
+            raise
         except McpError as e:
             logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
             return []
