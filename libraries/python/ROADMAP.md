@@ -34,7 +34,7 @@ For the latest status, see our [GitHub Issues](https://github.com/mcp-use/mcp-us
 
 ### Server
 - [ ] Server-side OAuth authentication (#955)
-- [ ] `MCPServer.mount()` for composing servers (#951)
+- [x] `MCPServer.mount()` for composing servers (#951)
 - [ ] Dependency injection (Depends) for tools (#870)
 
 ### Protocol

@@ -24,6 +24,7 @@
 | Example | Description |
 |---------|-------------|
 | [server/server_example.py](server/server_example.py) | Basic server with tools, resources, prompts, and annotations |
+| [server/mount_example.py](server/mount_example.py) | Compose a remote MCP server with `MCPServer.mount()` |
 | [server/middleware_example.py](server/middleware_example.py) | Server middleware (logging, auth, rate limiting) |
 | [server/context_example.py](server/context_example.py) | Server context usage (logging, sampling, notifications) |
 

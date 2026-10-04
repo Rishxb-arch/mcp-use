@@ -540,6 +540,7 @@
                   },
                   "python/server/middleware",
                   "python/server/router",
+                  "python/server/mount",
                   "python/server/inspector",
                   "python/server/logging",
                   "python/server/openmcp"

@@ -1,0 +1,96 @@
+---
+title: "Composing servers"
+description: "Mount remote MCP servers onto MCPServer"
+icon: "combine"
+---
+
+`MCPServer.mount()` exposes tools, resources, and prompts from any mcp-use connector on a server you control. Use it to put a local tool next to tools from a streamable-HTTP or stdio server. For local Python modules, use a [router](/python/server/router) instead. For embedding this server inside an existing FastAPI app, see [FastAPI mounting](/python/server/fastapi_mount).
+
+## Mount a connector
+
+```python
+from mcp_use import MCPServer
+from mcp_use.client.connectors import HttpConnector
+
+server = MCPServer(name="composed-tools")
+
+@server.tool()
+def my_local_tool(query: str) -> str:
+    """Answer from this process."""
+    return f"Local result for {query}"
+
+server.mount(HttpConnector("http://127.0.0.1:9000/mcp"), prefix="remote")
+
+if __name__ == "__main__":
+    server.run(transport="streamable-http", port=8080)
+```
+
+`tools/list` then contains `my_local_tool` and, for an upstream tool named `echo`, `remote_echo`. `tools/call` on `remote_echo` is forwarded to the connector as `echo`. Stdio connectors work the same way.
+
+Call `mount()` before `run()`. A mount added after startup is connected on the next request. The server connects each connector when it starts and disconnects it on shutdown, for both `streamable-http` and `stdio`.
+
+## Prefixes
+
+A prefix is applied the same way as `include_router`: `echo` with prefix `remote` becomes `remote_echo`. Prompts use that pattern too.
+
+Prefixes must match `[A-Za-z0-9_]` and be at most 48 characters. `browser-tools` is rejected. Prefixes are not rewritten, so two different strings cannot collapse into the same name. Omit `prefix` to keep upstream names.
+
+These names are errors when the catalog is built (the next `tools/list`, `tools/call`, or `server.call_tool`):
+
+- two mounts expose the same name
+- a mounted name matches a tool, prompt, or resource URI already defined on this server
+- the same connector object, or the same prefix, is mounted twice
+
+The request fails instead of hiding one of the definitions.
+
+## Calling mounted tools from a local tool
+
+`server.call_tool()` reaches mounted tools, which is how a local tool orchestrates other servers:
+
+```python
+from mcp.types import CallToolResult
+
+@server.tool()
+async def shout(text: str) -> str:
+    """Uppercase the mounted echo tool."""
+    result = await server.call_tool("remote_echo", {"text": text})
+    assert isinstance(result, CallToolResult)
+    return result.content[0].text.upper()
+```
+
+Mounted calls return a `CallToolResult`, including `isError` and structured content. Local `server.call_tool()` keeps the existing FastMCP return value, a `(content, structured)` tuple.
+
+## Resources and prompts
+
+Resources and prompts are mounted by default. Pass `resources=False` or `prompts=False` to skip either one.
+
+Prompt `greet` with prefix `remote` is exposed as `remote_greet`. Arguments are forwarded unchanged.
+
+Prefixed resource URIs are rewritten so two upstreams can both expose `note://hello`:
+
+```text
+mount://mounted/remote/note%3A%2F%2Fhello
+```
+
+`resources/read` on that URI is sent upstream as `note://hello`. Unprefixed mounts keep the original URI. Resource templates, sampling, elicitation, and list-changed notifications are not proxied.
+
+Upstream list cursors are followed and flattened into this server's single list. `BaseConnector.list_tools()` on its own returns only the first page.
+
+## Authentication
+
+The caller's `Authorization` header is not copied onto the mounted connector. A mount is one shared session, so a per-request caller token would race and would also send that token to another server.
+
+Put the upstream credential on the connector:
+
+```python
+server.mount(
+    HttpConnector("http://127.0.0.1:9000/mcp", auth="upstream-service-token"),
+    prefix="remote",
+)
+```
+
+Bearer auth on the composer still applies to callers of this server. It is a separate check from whatever the upstream requires.
+
+## Middleware
+
+Server middleware runs around the composed catalog. `on_list_tools` and `on_call_tool` see the prefixed names (`remote_echo`), not the upstream names. The connector's own client middleware, if you passed any, still applies to the upstream call.

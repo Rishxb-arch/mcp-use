@@ -5,30 +5,39 @@ import logging
 import os
 import time
 import weakref
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import mcp.server.lowlevel.server as lowlevel
 import mcp.server.session as mcp_session
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.types import (
     AnyFunction,
     CallToolRequest,
     CompleteRequest,
     Completion,
+    ContentBlock,
     GetPromptRequest,
+    GetPromptResult,
     Icon,
     ListPromptsRequest,
     ListResourcesRequest,
     ListToolsRequest,
+    Prompt,
     ReadResourceRequest,
+    Resource,
     ServerResult,
     SetLevelRequest,
     SubscribeRequest,
+    Tool,
     UnsubscribeRequest,
 )
+from pydantic import AnyUrl
 
 # Import auth components
+from mcp_use.client.connectors.base import BaseConnector
 from mcp_use.server.auth import AuthMiddleware, BearerAuthProvider
 from mcp_use.server.context import Context as MCPContext
 from mcp_use.server.logging import MCPLoggingMiddleware
@@ -39,6 +48,7 @@ from mcp_use.server.middleware import (
     TelemetryMiddleware,
 )
 from mcp_use.server.middleware.server_session import MiddlewareServerSession
+from mcp_use.server.mount import MountRegistry, wrap_lifespan
 from mcp_use.server.runner import ServerRunner
 from mcp_use.server.types import TransportType
 from mcp_use.server.utils.inspector import _inspector_index, _inspector_static
@@ -128,6 +138,7 @@ class MCPServer(FastMCP):
             host=host,
             port=port,
         )
+        self._mounts = MountRegistry()
 
         # Apply DNS rebinding protection if requested
         if dns_rebinding_protection:
@@ -335,6 +346,123 @@ class MCPServer(FastMCP):
                 description=prompt.description,
             )(prompt.fn)
 
+    @telemetry("server_mount_used")
+    def mount(
+        self,
+        connector: BaseConnector,
+        prefix: str | None = None,
+        *,
+        resources: bool = True,
+        prompts: bool = True,
+    ) -> None:
+        """Expose a connector's tools, and optionally resources and prompts, on this server.
+
+        Call this before ``run()``. Mounts added later are connected on the next
+        request and when the server lifespan starts. The connector is connected
+        for the server lifetime and disconnected on shutdown.
+
+        A prefix becomes ``{prefix}_{name}`` for tools and prompts, the same
+        separator ``include_router`` uses. Prefixes must match ``[A-Za-z0-9_]``
+        and are rejected, not rewritten, when they do not. Omit ``prefix`` to
+        keep upstream names. Colliding names are an error when the catalog is
+        built, not a silent override.
+
+        The caller's ``Authorization`` header is not forwarded. Configure
+        credentials on the connector itself.
+
+        Mounted ``call_tool`` results are :class:`~mcp.types.CallToolResult`
+        objects (content, structured content, and ``isError``). Local tools
+        keep the existing FastMCP return value.
+
+        Example:
+            ```python
+            from mcp_use import MCPServer
+            from mcp_use.client.connectors import HttpConnector
+
+            server = MCPServer(name="composed")
+            server.mount(HttpConnector("http://127.0.0.1:9000/mcp"), prefix="remote")
+
+            @server.tool()
+            async def shout(text: str) -> str:
+                result = await server.call_tool("remote_echo", {"text": text})
+                return result.content[0].text.upper()
+            ```
+        """
+        self._mounts.add(connector, prefix, resources=resources, prompts=prompts)
+
+    async def list_tools(self) -> list[Tool]:
+        """List local tools plus tools from mounted connectors."""
+        local = await super().list_tools()
+        if not self._mounts:
+            return local
+        await self._mounts.connect_all()
+        mounted = await self._mounts.exposed_tools({tool.name for tool in local})
+        return [*local, *mounted]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[ContentBlock] | dict[str, Any]:
+        """Call a local tool, or a mounted tool by its exposed name.
+
+        Mounted tools return a :class:`~mcp.types.CallToolResult` at runtime
+        (``isError`` and structured content included). The declared return type
+        matches FastMCP. Local tools still return FastMCP's ``(content, structured)``
+        tuple.
+        """
+        if self._mounts:
+            await self._mounts.connect_all()
+            local_names = {tool.name for tool in await super().list_tools()}
+            mounted = await self._mounts.call_tool(name, arguments or {}, local_names)
+            if mounted is not None:
+                return cast(Sequence[ContentBlock] | dict[str, Any], mounted)
+        return await super().call_tool(name, arguments)
+
+    async def list_resources(self) -> list[Resource]:
+        """List local resources plus resources from mounts that enable them."""
+        local = await super().list_resources()
+        if not self._mounts:
+            return local
+        await self._mounts.connect_all()
+        mounted = await self._mounts.exposed_resources({str(resource.uri) for resource in local})
+        return [*local, *mounted]
+
+    async def read_resource(self, uri: AnyUrl | str) -> Iterable[ReadResourceContents]:
+        """Read a local resource, or a mounted one by its exposed URI."""
+        if self._mounts:
+            await self._mounts.connect_all()
+            local = await super().list_resources()
+            # Build the catalog first so URI collisions fail closed, same as list_resources.
+            await self._mounts.exposed_resources({str(resource.uri) for resource in local})
+            mounted = await self._mounts.read_resource(str(uri))
+            if mounted is not None:
+                return mounted
+        return await super().read_resource(uri)
+
+    async def list_prompts(self) -> list[Prompt]:
+        """List local prompts plus prompts from mounts that enable them."""
+        local = await super().list_prompts()
+        if not self._mounts:
+            return local
+        await self._mounts.connect_all()
+        mounted = await self._mounts.exposed_prompts({prompt.name for prompt in local})
+        return [*local, *mounted]
+
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult:
+        """Render a local prompt, or a mounted one by its exposed name."""
+        if self._mounts:
+            await self._mounts.connect_all()
+            local_names = {prompt.name for prompt in await super().list_prompts()}
+            mounted = await self._mounts.get_prompt(name, arguments, local_names)
+            if mounted is not None:
+                return mounted
+        return await super().get_prompt(name, arguments)
+
+    async def run_stdio_async(self) -> None:
+        """Run stdio, connecting mounted connectors for the process lifetime."""
+        try:
+            await self._mounts.connect_all()
+            await super().run_stdio_async()
+        finally:
+            await self._mounts.disconnect_all()
+
     def _apply_dns_rebinding_protection(self, host: str) -> None:
         """Configure transport security to reject non-localhost Host/Origin headers."""
         from mcp.server.transport_security import TransportSecuritySettings
@@ -464,6 +592,7 @@ class MCPServer(FastMCP):
                 expose_headers=["WWW-Authenticate"],
             )
 
+        app.router.lifespan_context = wrap_lifespan(self._mounts, app.router.lifespan_context)
         return app
 
     def _wrap_handlers_with_middleware(self) -> None:

@@ -1,5 +1,6 @@
 from .context import Context
 from .middleware import Middleware, TelemetryMiddleware
+from .mount import MountError
 from .router import MCPRouter
 from .server import MCPServer
 
@@ -13,4 +14,5 @@ __all__ = [
     "Context",
     "Middleware",
     "TelemetryMiddleware",
+    "MountError",
 ]
